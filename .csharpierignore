@@ -1,0 +1,6 @@
+# O CSharpier formata apenas C#; arquivos de projeto/solucao ficam de fora.
+*.csproj
+*.props
+*.targets
+*.sln
+*.slnx
