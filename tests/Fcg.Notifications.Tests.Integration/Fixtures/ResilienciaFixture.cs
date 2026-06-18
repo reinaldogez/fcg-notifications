@@ -7,19 +7,19 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Testing;
 using Testcontainers.RabbitMq;
-using Testcontainers.Redis;
 
 namespace Fcg.Notifications.Tests.Integration.Fixtures;
 
-// Sobe Redis + RabbitMQ reais uma única vez e monta um host genérico com o wiring de produção
-// (AddApplication + AddInfrastructure). O log é capturado por FakeLogCollector — sem Serilog no
-// caminho, todos os records (handlers + bus) chegam ao coletor.
-public sealed class IntegrationFixture : IAsyncLifetime
+// RabbitMQ próprio (não o compartilhado, para não virar consumidor concorrente da mesma fila) e um
+// Redis inalcançável de propósito: o consumer falha ao marcar idempotência e nunca chega ao handler.
+public sealed class ResilienciaFixture : IAsyncLifetime
 {
     private const string BrokerUser = "fcg";
     private const string BrokerPass = "fcg";
 
-    private readonly RedisContainer _redis = new RedisBuilder("redis:7.4-alpine").Build();
+    // abortConnect padrão (true): o Connect falha rápido em vez de esperar o timeout de comando a
+    // cada retry, então o fault aparece dentro da janela do teste.
+    private const string RedisMorto = "localhost:6390,connectTimeout=500,connectRetry=0";
 
     private readonly RabbitMqContainer _rabbit = new RabbitMqBuilder(
         "rabbitmq:3.13-management-alpine"
@@ -36,16 +36,14 @@ public sealed class IntegrationFixture : IAsyncLifetime
 
     public async Task InitializeAsync()
     {
-        await Task.WhenAll(_redis.StartAsync(), _rabbit.StartAsync());
+        await _rabbit.StartAsync();
 
         HostApplicationBuilder builder = Host.CreateApplicationBuilder();
 
         builder.Configuration.AddInMemoryCollection(
             new Dictionary<string, string?>
             {
-                ["Redis:Connection"] = _redis.GetConnectionString(),
-                // URI completa (amqp://user:pass@host:porta-dinâmica): o Host(string) de produção
-                // resolve host e porta a partir dela, sem mapear porta fixa no container.
+                ["Redis:Connection"] = RedisMorto,
                 ["RabbitMq:Host"] = _rabbit.GetConnectionString(),
                 ["RabbitMq:Username"] = BrokerUser,
                 ["RabbitMq:Password"] = BrokerPass,
@@ -54,14 +52,13 @@ public sealed class IntegrationFixture : IAsyncLifetime
 
         builder.Logging.ClearProviders();
         builder.Logging.AddFakeLogging();
-        // Os nomes de fila aparecem nos logs de topologia do bus, emitidos em Debug.
         builder.Logging.AddFilter("MassTransit", LogLevel.Debug);
 
         builder.Services.AddApplication();
         builder.Services.AddInfrastructure(builder.Configuration);
 
-        // StartAsync só retorna com o bus pronto (filas declaradas/bound), senão a primeira
-        // publicação pode se perder antes de o endpoint existir — flaky sob carga de Docker.
+        // StartAsync só retorna com o bus pronto (fila declarada/bound), senão a primeira (e única)
+        // publicação pode se perder antes do endpoint existir e a mensagem nunca falhar.
         builder.Services.Configure<MassTransitHostOptions>(options =>
         {
             options.WaitUntilStarted = true;
@@ -81,32 +78,26 @@ public sealed class IntegrationFixture : IAsyncLifetime
         }
 
         await _rabbit.DisposeAsync();
-        await _redis.DisposeAsync();
     }
 
-    // Espera até haver pelo menos 'atLeast' logs cujo texto contém o token único do teste (ou o
-    // timeout). Devolve os logs casados — o consumo é assíncrono sobre um broker real.
-    public async Task<IReadOnlyList<FakeLogRecord>> EsperarLogsAsync(
-        string token,
-        int atLeast,
-        TimeSpan timeout
-    )
+    public List<FakeLogRecord> LogsComToken(string token) =>
+        Logs.GetSnapshot().Where(r => r.Message.Contains(token, StringComparison.Ordinal)).ToList();
+
+    // Espera o consumer falhar (MassTransit loga a exceção em Error) ou o timeout. O retry curto
+    // configurado (3 × 2s) atrasa o fault, então a janela precisa ser folgada.
+    public async Task<bool> EsperarFaultAsync(TimeSpan timeout)
     {
         DateTime deadline = DateTime.UtcNow + timeout;
         while (DateTime.UtcNow < deadline)
         {
-            List<FakeLogRecord> casados = LogsComToken(token);
-            if (casados.Count >= atLeast)
+            if (Logs.GetSnapshot().Any(r => r.Level == LogLevel.Error))
             {
-                return casados;
+                return true;
             }
 
             await Task.Delay(100);
         }
 
-        return LogsComToken(token);
+        return false;
     }
-
-    public List<FakeLogRecord> LogsComToken(string token) =>
-        Logs.GetSnapshot().Where(r => r.Message.Contains(token, StringComparison.Ordinal)).ToList();
 }
